@@ -118,6 +118,40 @@ def join(p:InviteIn,u=Depends(user)):
   c.execute('INSERT OR IGNORE INTO members VALUES(?,?,?)',(r['id'],u['id'],'member'))
  return {'ok':True}
 
+@app.delete('/api/groups/{gid}')
+def delete_group(gid:str,u=Depends(user)):
+ # Only the group owner can remove the group and all of its cases.
+ videos=[]
+ with conn() as c:
+  g=c.execute('SELECT id,name,owner FROM groups WHERE id=?',(gid,)).fetchone()
+  if not g:fail(404,'找不到群組')
+  if g['owner']!=u['id']:fail(403,'只有群組建立者可以刪除群組')
+  videos=[r['video'] for r in c.execute('SELECT video FROM cases WHERE group_id=? AND video IS NOT NULL',(gid,))]
+  c.execute('DELETE FROM votes WHERE case_id IN (SELECT id FROM cases WHERE group_id=?)',(gid,))
+  c.execute('DELETE FROM comments WHERE case_id IN (SELECT id FROM cases WHERE group_id=?)',(gid,))
+  c.execute('DELETE FROM cases WHERE group_id=?',(gid,))
+  c.execute('DELETE FROM members WHERE group_id=?',(gid,))
+  c.execute('DELETE FROM groups WHERE id=?',(gid,))
+ # Remove uploaded video files only after database changes are committed.
+ for name in videos:
+  (UPLOAD/name).unlink(missing_ok=True)
+ return {'ok':True,'deleted_cases':len(videos)}
+
+
+@app.delete('/api/cases/{cid}')
+def delete_case(cid:str,u=Depends(user)):
+ with conn() as c:
+  r=get_case(c,cid,u['id'])
+  if r['author']!=u['id'] and member(c,r['group_id'],u['id'])!='owner':
+   fail(403,'只有判例建立者或群組建立者可以刪除判例')
+  video=r['video']
+  c.execute('DELETE FROM votes WHERE case_id=?',(cid,))
+  c.execute('DELETE FROM comments WHERE case_id=?',(cid,))
+  c.execute('DELETE FROM cases WHERE id=?',(cid,))
+ if video:(UPLOAD/video).unlink(missing_ok=True)
+ return {'ok':True}
+
+
 @app.get('/api/cases')
 def cases(group_id:str,u=Depends(user)):
  with conn() as c:
