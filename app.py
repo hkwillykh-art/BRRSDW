@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from cloud_backend import CLOUD_ENABLED, PARTIAL, postgres_conn, upload_object, signed_media_url, remove_objects
+from cloud_backend import CLOUD_ENABLED, PARTIAL, postgres_conn, upload_object, signed_media_url, remove_objects, private_bucket_ready
 import psycopg
 import logging
 logger=logging.getLogger('brrs')
@@ -86,7 +86,8 @@ class VoteIn(BaseModel):choice:str=Field(min_length=1,max_length=80)
 def health():
  try:
   with conn() as c: c.execute('SELECT 1').fetchone()
-  return {'status':'ok','database':'cloud-postgres' if CLOUD_ENABLED else 'local-ephemeral','video_storage':'supabase-private' if CLOUD_ENABLED else 'local-ephemeral','configuration_incomplete':PARTIAL}
+  storage_ok=private_bucket_ready() if CLOUD_ENABLED else False
+  return {'status':'ok','database':'cloud-postgres' if CLOUD_ENABLED else 'local-ephemeral','video_storage':'supabase-private' if storage_ok else 'not-configured','configuration_incomplete':PARTIAL or (CLOUD_ENABLED and not storage_ok)}
  except Exception:fail(503,'資料庫暫時無法使用')
 
 @app.post('/api/register')
