@@ -47,6 +47,14 @@ def storage_headers(extra=None):
 def storage_base():
     return SUPABASE_URL + "/storage/v1"
 
+def private_bucket_ready():
+    response = requests.get(storage_base() + "/bucket/" + quote(BUCKET, safe=""),
+                            headers=storage_headers(), timeout=(10, 20))
+    if not response.ok:
+        return False
+    data = response.json()
+    return data.get("public") is False
+
 def upload_object(object_key, filepath, mime):
     url = storage_base() + "/object/" + quote(BUCKET, safe="") + "/" + quote(object_key, safe="/")
     with open(filepath, "rb") as data:
