@@ -1,0 +1,10 @@
+# Demonstration only; free ephemeral disk may lose all users, votes and videos.
+services:
+  - type: web
+    name: brrs-demo
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: BRRS_MAX_UPLOAD_MB
+        value: "25"
