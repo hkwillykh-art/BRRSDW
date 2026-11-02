@@ -5,6 +5,10 @@ from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from cloud_backend import CLOUD_ENABLED, PARTIAL, postgres_conn, upload_object, signed_media_url, remove_objects
+import psycopg
+import logging
+logger=logging.getLogger('brrs')
 
 BASE=Path(__file__).resolve().parent
 DATA=Path(os.getenv('BRRS_DATA_DIR',str(BASE/'data')))
@@ -16,16 +20,29 @@ app=FastAPI(title='BRRS V3.0')
 
 @contextmanager
 def conn():
- c=sqlite3.connect(DB,timeout=30);c.row_factory=sqlite3.Row;c.execute('PRAGMA foreign_keys=ON')
- try: yield c; c.commit()
- finally: c.close()
+ if CLOUD_ENABLED:
+  with postgres_conn() as c:
+   yield c
+  return
+ c=sqlite3.connect(DB,timeout=30)
+ c.row_factory=sqlite3.Row
+ c.execute('PRAGMA foreign_keys=ON')
+ try:
+  yield c
+ except Exception:
+  c.rollback()
+  raise
+ else:
+  c.commit()
+ finally:
+  c.close()
 
 with conn() as c:
  c.executescript('''CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,passhash TEXT NOT NULL,created INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS sessions(tokenhash TEXT PRIMARY KEY,user_id TEXT NOT NULL,expires INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS groups(id TEXT PRIMARY KEY,name TEXT NOT NULL,invite TEXT UNIQUE NOT NULL,owner TEXT NOT NULL,created INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS members(group_id TEXT NOT NULL,user_id TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'member',PRIMARY KEY(group_id,user_id));
- CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,author TEXT NOT NULL,title TEXT NOT NULL,game TEXT,period TEXT,category TEXT,original TEXT,rule TEXT,notes TEXT,video TEXT,source_url TEXT,start REAL NOT NULL DEFAULT 0,end REAL NOT NULL DEFAULT 0,created INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS cases(id TEXT PRIMARY KEY,group_id TEXT NOT NULL,author TEXT NOT NULL,title TEXT NOT NULL,game TEXT,period TEXT,category TEXT,original TEXT,rule TEXT,notes TEXT,video TEXT,source_url TEXT,start REAL NOT NULL DEFAULT 0,"end" REAL NOT NULL DEFAULT 0,created INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY,case_id TEXT NOT NULL,author TEXT NOT NULL,body TEXT NOT NULL,created INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS votes(case_id TEXT NOT NULL,user_id TEXT NOT NULL,choice TEXT NOT NULL,PRIMARY KEY(case_id,user_id));''')
 
@@ -69,8 +86,8 @@ class VoteIn(BaseModel):choice:str=Field(min_length=1,max_length=80)
 def health():
  try:
   with conn() as c: c.execute('SELECT 1').fetchone()
-  return {'status':'ok','database':'connected'}
- except sqlite3.Error:fail(503,'資料庫暫時無法使用')
+  return {'status':'ok','database':'cloud-postgres' if CLOUD_ENABLED else 'local-ephemeral','video_storage':'supabase-private' if CLOUD_ENABLED else 'local-ephemeral','configuration_incomplete':PARTIAL}
+ except Exception:fail(503,'資料庫暫時無法使用')
 
 @app.post('/api/register')
 def register(p:Register):
@@ -78,7 +95,7 @@ def register(p:Register):
  if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',email):fail(400,'Email 格式錯誤')
  with conn() as c:
   try:c.execute('INSERT INTO users VALUES(?,?,?,?,?)',(uuid.uuid4().hex,p.name.strip(),email,hash_pw(p.password),int(time.time())))
-  except sqlite3.IntegrityError:fail(409,'Email 已註冊')
+  except (sqlite3.IntegrityError,psycopg.IntegrityError):fail(409,'Email 已註冊')
  return {'ok':True}
 
 @app.post('/api/login')
@@ -133,8 +150,11 @@ def delete_group(gid:str,u=Depends(user)):
   c.execute('DELETE FROM members WHERE group_id=?',(gid,))
   c.execute('DELETE FROM groups WHERE id=?',(gid,))
  # Remove uploaded video files only after database changes are committed.
- for name in videos:
-  (UPLOAD/name).unlink(missing_ok=True)
+ if CLOUD_ENABLED:
+  try:remove_objects(videos)
+  except Exception:logger.exception('Failed to clean group videos from cloud storage')
+ else:
+  for name in videos:(UPLOAD/name).unlink(missing_ok=True)
  return {'ok':True,'deleted_cases':len(videos)}
 
 
@@ -148,7 +168,11 @@ def delete_case(cid:str,u=Depends(user)):
   c.execute('DELETE FROM votes WHERE case_id=?',(cid,))
   c.execute('DELETE FROM comments WHERE case_id=?',(cid,))
   c.execute('DELETE FROM cases WHERE id=?',(cid,))
- if video:(UPLOAD/video).unlink(missing_ok=True)
+ if video:
+  if CLOUD_ENABLED:
+   try:remove_objects([video])
+   except Exception:logger.exception('Failed to remove case video from cloud storage')
+  else:(UPLOAD/video).unlink(missing_ok=True)
  return {'ok':True}
 
 
@@ -183,13 +207,25 @@ async def upload_video(cid:str,file:UploadFile=File(...),u=Depends(user)):
     if total>MAX_BYTES:fail(413,'影片超過上傳限制')
     out.write(chunk)
   if not total:fail(400,'影片內容為空')
+  if CLOUD_ENABLED:
+   upload_object(name,target,{'mp4':'video/mp4','webm':'video/webm','mov':'video/quicktime','m4v':'video/x-m4v'}[ext[1:]])
   with conn() as c:
    r=get_case(c,cid,u['id'])
    if r['author']!=u['id'] and member(c,r['group_id'],u['id'])!='owner':fail(403,'只有上傳者或群組管理員可替換影片')
    old=r['video'];c.execute('UPDATE cases SET video=? WHERE id=?',(name,cid))
-  if old:(UPLOAD/old).unlink(missing_ok=True)
+  if old:
+   if CLOUD_ENABLED:
+    try:remove_objects([old])
+    except Exception:logger.exception('Failed to remove replaced cloud video')
+   else:(UPLOAD/old).unlink(missing_ok=True)
  except Exception:
-  target.unlink(missing_ok=True);raise
+  if CLOUD_ENABLED:
+   try:remove_objects([name])
+   except Exception:logger.exception('Cloud upload rollback failed')
+  target.unlink(missing_ok=True)
+  raise
+ finally:
+  if CLOUD_ENABLED:target.unlink(missing_ok=True)
  return {'ok':True,'size':total}
 
 @app.get('/api/cases/{cid}/video')
@@ -202,6 +238,11 @@ def play(cid:str,u=Depends(user)):
  with conn() as c:
   r=get_case(c,cid,u['id'])
   if not r['video']:fail(404,'尚未上傳影片')
+  if CLOUD_ENABLED:
+   try:return {'url':signed_media_url(r['video'],600)}
+   except Exception:
+    logger.exception('Cloud signed video URL failed')
+    fail(503,'雲端影片暫時無法播放')
   exp=int(time.time())+600
   sig=hmac.new(secret_key(),f'{cid}:{r["video"]}:{exp}'.encode(),hashlib.sha256).hexdigest()
  return {'url':f'/api/media/{cid}?exp={exp}&sig={sig}'}
@@ -248,7 +289,7 @@ def vote(cid:str,p:VoteIn,u=Depends(user)):
   get_case(c,cid,u['id'])
   try:
    c.execute('INSERT INTO votes VALUES(?,?,?)',(cid,u['id'],p.choice))
-  except sqlite3.IntegrityError:
+  except (sqlite3.IntegrityError,psycopg.IntegrityError):
    fail(409,'此帳號已對這個判例投票，不能重複投票或更改選項')
  return {'ok':True}
 
