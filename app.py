@@ -5,7 +5,11 @@ from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from cloud_backend import CLOUD_ENABLED, PARTIAL, postgres_conn, upload_object, signed_media_url, remove_objects, private_bucket_ready
+from cloud_backend import (
+ CLOUD_ENABLED, DATABASE_ENABLED, VIDEO_BACKEND, PARTIAL, postgres_conn,
+ private_bucket_ready, r2_bucket_ready, store_video, video_signed_url,
+ remove_stored_videos
+)
 import psycopg
 import logging
 logger=logging.getLogger('brrs')
@@ -86,8 +90,13 @@ class VoteIn(BaseModel):choice:str=Field(min_length=1,max_length=80)
 def health():
  try:
   with conn() as c: c.execute('SELECT 1').fetchone()
-  storage_ok=private_bucket_ready() if CLOUD_ENABLED else False
-  return {'status':'ok','database':'cloud-postgres' if CLOUD_ENABLED else 'local-ephemeral','video_storage':'supabase-private' if storage_ok else 'not-configured','configuration_incomplete':PARTIAL or (CLOUD_ENABLED and not storage_ok)}
+  storage_ok=(r2_bucket_ready() if VIDEO_BACKEND=='r2' else
+              private_bucket_ready() if VIDEO_BACKEND=='supabase' else False)
+  storage_type=('cloudflare-r2-private' if VIDEO_BACKEND=='r2' else
+                'supabase-private' if VIDEO_BACKEND=='supabase' else 'local-ephemeral')
+  return {'status':'ok','database':'cloud-postgres' if DATABASE_ENABLED else 'local-ephemeral',
+          'video_storage':storage_type if storage_ok else 'not-configured',
+          'configuration_incomplete':PARTIAL or not storage_ok}
  except Exception:fail(503,'資料庫暫時無法使用')
 
 @app.post('/api/register')
@@ -151,11 +160,10 @@ def delete_group(gid:str,u=Depends(user)):
   c.execute('DELETE FROM members WHERE group_id=?',(gid,))
   c.execute('DELETE FROM groups WHERE id=?',(gid,))
  # Remove uploaded video files only after database changes are committed.
- if CLOUD_ENABLED:
-  try:remove_objects(videos)
-  except Exception:logger.exception('Failed to clean group videos from cloud storage')
- else:
-  for name in videos:(UPLOAD/name).unlink(missing_ok=True)
+ try:
+  local_keys=remove_stored_videos(videos)
+  for name in local_keys:(UPLOAD/name).unlink(missing_ok=True)
+ except Exception:logger.exception('Failed to remove deleted group videos from storage')
  return {'ok':True,'deleted_cases':len(videos)}
 
 
@@ -170,10 +178,10 @@ def delete_case(cid:str,u=Depends(user)):
   c.execute('DELETE FROM comments WHERE case_id=?',(cid,))
   c.execute('DELETE FROM cases WHERE id=?',(cid,))
  if video:
-  if CLOUD_ENABLED:
-   try:remove_objects([video])
-   except Exception:logger.exception('Failed to remove case video from cloud storage')
-  else:(UPLOAD/video).unlink(missing_ok=True)
+  try:
+   local_keys=remove_stored_videos([video])
+   for name in local_keys:(UPLOAD/name).unlink(missing_ok=True)
+  except Exception:logger.exception('Failed to remove deleted case video')
  return {'ok':True}
 
 
@@ -208,25 +216,26 @@ async def upload_video(cid:str,file:UploadFile=File(...),u=Depends(user)):
     if total>MAX_BYTES:fail(413,'影片超過上傳限制')
     out.write(chunk)
   if not total:fail(400,'影片內容為空')
-  if CLOUD_ENABLED:
-   upload_object(name,target,{'mp4':'video/mp4','webm':'video/webm','mov':'video/quicktime','m4v':'video/x-m4v'}[ext[1:]])
+  stored_key=store_video(name,target,{'mp4':'video/mp4','webm':'video/webm','mov':'video/quicktime','m4v':'video/x-m4v'}[ext[1:]])
   with conn() as c:
    r=get_case(c,cid,u['id'])
    if r['author']!=u['id'] and member(c,r['group_id'],u['id'])!='owner':fail(403,'只有上傳者或群組管理員可替換影片')
-   old=r['video'];c.execute('UPDATE cases SET video=? WHERE id=?',(name,cid))
+   old=r['video'];c.execute('UPDATE cases SET video=? WHERE id=?',(stored_key,cid))
   if old:
-   if CLOUD_ENABLED:
-    try:remove_objects([old])
-    except Exception:logger.exception('Failed to remove replaced cloud video')
-   else:(UPLOAD/old).unlink(missing_ok=True)
+   try:
+    local_keys=remove_stored_videos([old])
+    for local_key in local_keys:(UPLOAD/local_key).unlink(missing_ok=True)
+   except Exception:logger.exception('Failed to delete replaced video')
  except Exception:
-  if CLOUD_ENABLED:
-   try:remove_objects([name])
-   except Exception:logger.exception('Cloud upload rollback failed')
+  if 'stored_key' in locals():
+   try:
+    local_keys=remove_stored_videos([stored_key])
+    for local_key in local_keys:(UPLOAD/local_key).unlink(missing_ok=True)
+   except Exception:logger.exception('Failed to roll back cloud video upload')
   target.unlink(missing_ok=True)
   raise
  finally:
-  if CLOUD_ENABLED:target.unlink(missing_ok=True)
+  if VIDEO_BACKEND!='local':target.unlink(missing_ok=True)
  return {'ok':True,'size':total}
 
 @app.get('/api/cases/{cid}/video')
@@ -239,10 +248,14 @@ def play(cid:str,u=Depends(user)):
  with conn() as c:
   r=get_case(c,cid,u['id'])
   if not r['video']:fail(404,'尚未上傳影片')
-  if CLOUD_ENABLED:
-   try:return {'url':signed_media_url(r['video'],600)}
+  if VIDEO_BACKEND!='local' or r['video'].startswith(('r2:','sb:')):
+   try:
+    url=video_signed_url(r['video'],600)
+    if url:return {'url':url}
+    fail(404,'此影片尚未遷移至雲端儲存')
+   except HTTPException:raise
    except Exception:
-    logger.exception('Cloud signed video URL failed')
+    logger.exception('Cloud video playback failed')
     fail(503,'雲端影片暫時無法播放')
   exp=int(time.time())+600
   sig=hmac.new(secret_key(),f'{cid}:{r["video"]}:{exp}'.encode(),hashlib.sha256).hexdigest()
