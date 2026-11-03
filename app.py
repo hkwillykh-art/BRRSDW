@@ -1,7 +1,7 @@
 import os, sqlite3, secrets, hashlib, hmac, re, time, uuid
 from pathlib import Path
 from contextlib import contextmanager
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -12,6 +12,7 @@ from cloud_backend import (
 )
 import psycopg
 import logging
+from security import login_throttled, note_failed_login, clear_failed_login
 logger=logging.getLogger('brrs')
 
 BASE=Path(__file__).resolve().parent
@@ -20,7 +21,20 @@ UPLOAD=Path(os.getenv('BRRS_UPLOAD_DIR',str(BASE/'uploads')))
 DATA.mkdir(parents=True,exist_ok=True); UPLOAD.mkdir(parents=True,exist_ok=True)
 DB=DATA/'brrs.db'; MAX_BYTES=int(os.getenv('BRRS_MAX_UPLOAD_MB','25'))*1024*1024
 ALLOWED_VOTES={'正確宣判','錯誤宣判','需要更多角度'}
-app=FastAPI(title='BRRS V3.0')
+# Commercial environments must never silently fall back to disposable local storage.
+if os.getenv('BRRS_ENV','').lower()=='production' and (not DATABASE_ENABLED or VIDEO_BACKEND=='local' or PARTIAL):
+ raise RuntimeError('Production requires persistent Postgres and configured private video storage')
+app=FastAPI(title='BRRS Referee Review API', version='4.0.0-beta')
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+ response=await call_next(request)
+ response.headers['X-Content-Type-Options']='nosniff'
+ response.headers['X-Frame-Options']='DENY'
+ response.headers['Referrer-Policy']='strict-origin-when-cross-origin'
+ response.headers['Permissions-Policy']='camera=(), microphone=(), geolocation=()'
+ response.headers['Cache-Control']='no-store' if request.url.path.startswith('/api/') else 'no-cache'
+ return response
 
 @contextmanager
 def conn():
@@ -78,8 +92,9 @@ def get_case(c,cid,uid):
  member(c,r['group_id'],uid)
  return r
 
-class Register(BaseModel):name:str=Field(min_length=1,max_length=60);email:str;password:str=Field(min_length=8,max_length=128)
-class Login(BaseModel):email:str;password:str
+class Register(BaseModel):name:str=Field(min_length=1,max_length=60);email:str=Field(max_length=254);password:str=Field(min_length=12,max_length=128)
+class Login(BaseModel):email:str=Field(max_length=254);password:str
+class ChangePassword(BaseModel):current_password:str;new_password:str=Field(min_length=12,max_length=128)
 class GroupIn(BaseModel):name:str=Field(min_length=1,max_length=80)
 class InviteIn(BaseModel):code:str
 class CaseIn(BaseModel):group_id:str;title:str=Field(min_length=1,max_length=160);game:str='';period:str='';category:str='';original:str='';rule:str='';notes:str='';source_url:str='';start:float=0;end:float=0
@@ -109,10 +124,16 @@ def register(p:Register):
  return {'ok':True}
 
 @app.post('/api/login')
-def login(p:Login):
+def login(p:Login,request:Request):
+ email=p.email.strip().lower()
+ client_id=request.client.host if request.client else 'unknown'
+ if login_throttled(client_id,email):fail(429,'登入嘗試次數過多，請稍後再試')
  with conn() as c:
-  r=c.execute('SELECT * FROM users WHERE email=?',(p.email.strip().lower(),)).fetchone()
-  if not r or not check_pw(p.password,r['passhash']):fail(401,'帳號或密碼錯誤')
+  r=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+  if not r or not check_pw(p.password,r['passhash']):
+   note_failed_login(client_id,email)
+   fail(401,'帳號或密碼錯誤')
+  clear_failed_login(client_id,email)
   token=secrets.token_urlsafe(40)
   c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),r['id'],int(time.time())+7*86400))
  return {'token':token,'user':{'id':r['id'],'name':r['name'],'email':r['email']}}
@@ -125,9 +146,25 @@ def logout(authorization:str|None=Header(default=None),u=Depends(user)):
 @app.get('/api/me')
 def me(u=Depends(user)):return u
 
+@app.post('/api/me/change-password')
+def change_password(p:ChangePassword,u=Depends(user)):
+ if p.current_password==p.new_password:fail(400,'新密碼不可與原密碼相同')
+ with conn() as c:
+  r=c.execute('SELECT passhash FROM users WHERE id=?',(u['id'],)).fetchone()
+  if not r or not check_pw(p.current_password,r['passhash']):fail(403,'目前密碼不正確')
+  c.execute('UPDATE users SET passhash=? WHERE id=?',(hash_pw(p.new_password),u['id']))
+  c.execute('DELETE FROM sessions WHERE user_id=?',(u['id'],))
+ return {'ok':True,'message':'密碼已更新，所有裝置均須重新登入'}
+
 @app.get('/api/groups')
 def groups(u=Depends(user)):
- with conn() as c:return [obj(x) for x in c.execute('SELECT groups.id,groups.name,groups.invite,members.role FROM groups JOIN members ON groups.id=members.group_id WHERE members.user_id=? ORDER BY groups.created DESC',(u['id'],))]
+ with conn() as c:
+  sql="""SELECT groups.id,groups.name,
+          CASE WHEN members.role='owner' THEN groups.invite ELSE NULL END AS invite,
+          members.role
+          FROM groups JOIN members ON groups.id=members.group_id
+          WHERE members.user_id=? ORDER BY groups.created DESC"""
+  return [obj(x) for x in c.execute(sql,(u['id'],))]
 
 @app.post('/api/groups')
 def create_group(p:GroupIn,u=Depends(user)):
@@ -143,6 +180,29 @@ def join(p:InviteIn,u=Depends(user)):
   r=c.execute('SELECT id FROM groups WHERE invite=?',(p.code.strip(),)).fetchone()
   if not r:fail(404,'邀請碼不存在')
   c.execute('INSERT OR IGNORE INTO members VALUES(?,?,?)',(r['id'],u['id'],'member'))
+ return {'ok':True}
+
+@app.get('/api/groups/{gid}/members')
+def group_members(gid:str,u=Depends(user)):
+ with conn() as c:
+  member(c,gid,u['id'])
+  return [obj(r) for r in c.execute('SELECT users.id,users.name,members.role FROM members JOIN users ON users.id=members.user_id WHERE members.group_id=? ORDER BY members.role DESC, users.name',(gid,))]
+
+@app.post('/api/groups/{gid}/rotate-invite')
+def rotate_invite(gid:str,u=Depends(user)):
+ with conn() as c:
+  if member(c,gid,u['id'])!='owner':fail(403,'只有群組建立者可以更新邀請碼')
+  code=secrets.token_urlsafe(16)
+  c.execute('UPDATE groups SET invite=? WHERE id=?',(code,gid))
+ return {'invite':code}
+
+@app.delete('/api/groups/{gid}/members/{uid}')
+def remove_group_member(gid:str,uid:str,u=Depends(user)):
+ with conn() as c:
+  if member(c,gid,u['id'])!='owner':fail(403,'只有群組建立者可以移除成員')
+  if uid==u['id']:fail(400,'群組建立者不能移除自己')
+  r=c.execute('DELETE FROM members WHERE group_id=? AND user_id=?',(gid,uid))
+  if not r.rowcount:fail(404,'群組中找不到這位成員')
  return {'ok':True}
 
 @app.delete('/api/groups/{gid}')
