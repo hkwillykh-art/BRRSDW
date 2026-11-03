@@ -21,6 +21,9 @@ UPLOAD=Path(os.getenv('BRRS_UPLOAD_DIR',str(BASE/'uploads')))
 DATA.mkdir(parents=True,exist_ok=True); UPLOAD.mkdir(parents=True,exist_ok=True)
 DB=DATA/'brrs.db'; MAX_BYTES=int(os.getenv('BRRS_MAX_UPLOAD_MB','25'))*1024*1024
 ALLOWED_VOTES={'正確宣判','錯誤宣判','需要更多角度'}
+# Commercial environments must never silently fall back to disposable local storage.
+if os.getenv('BRRS_ENV','').lower()=='production' and (not DATABASE_ENABLED or VIDEO_BACKEND=='local' or PARTIAL):
+ raise RuntimeError('Production requires persistent Postgres and configured private video storage')
 app=FastAPI(title='BRRS Referee Review API', version='4.0.0-beta')
 
 @app.middleware("http")
@@ -155,7 +158,7 @@ def change_password(p:ChangePassword,u=Depends(user)):
 
 @app.get('/api/groups')
 def groups(u=Depends(user)):
- with conn() as c:return [obj(x) for x in c.execute('SELECT groups.id,groups.name,groups.invite,members.role FROM groups JOIN members ON groups.id=members.group_id WHERE members.user_id=? ORDER BY groups.created DESC',(u['id'],))]
+ with conn() as c:return [obj(x) for x in c.execute('SELECT groups.id,groups.name,CASE WHEN members.role='owner' THEN groups.invite ELSE NULL END AS invite,members.role FROM groups JOIN members ON groups.id=members.group_id WHERE members.user_id=? ORDER BY groups.created DESC',(u['id'],))]
 
 @app.post('/api/groups')
 def create_group(p:GroupIn,u=Depends(user)):
@@ -171,6 +174,29 @@ def join(p:InviteIn,u=Depends(user)):
   r=c.execute('SELECT id FROM groups WHERE invite=?',(p.code.strip(),)).fetchone()
   if not r:fail(404,'邀請碼不存在')
   c.execute('INSERT OR IGNORE INTO members VALUES(?,?,?)',(r['id'],u['id'],'member'))
+ return {'ok':True}
+
+@app.get('/api/groups/{gid}/members')
+def group_members(gid:str,u=Depends(user)):
+ with conn() as c:
+  member(c,gid,u['id'])
+  return [obj(r) for r in c.execute('SELECT users.id,users.name,members.role FROM members JOIN users ON users.id=members.user_id WHERE members.group_id=? ORDER BY members.role DESC, users.name',(gid,))]
+
+@app.post('/api/groups/{gid}/rotate-invite')
+def rotate_invite(gid:str,u=Depends(user)):
+ with conn() as c:
+  if member(c,gid,u['id'])!='owner':fail(403,'只有群組建立者可以更新邀請碼')
+  code=secrets.token_urlsafe(16)
+  c.execute('UPDATE groups SET invite=? WHERE id=?',(code,gid))
+ return {'invite':code}
+
+@app.delete('/api/groups/{gid}/members/{uid}')
+def remove_group_member(gid:str,uid:str,u=Depends(user)):
+ with conn() as c:
+  if member(c,gid,u['id'])!='owner':fail(403,'只有群組建立者可以移除成員')
+  if uid==u['id']:fail(400,'群組建立者不能移除自己')
+  r=c.execute('DELETE FROM members WHERE group_id=? AND user_id=?',(gid,uid))
+  if not r.rowcount:fail(404,'群組中找不到這位成員')
  return {'ok':True}
 
 @app.delete('/api/groups/{gid}')
