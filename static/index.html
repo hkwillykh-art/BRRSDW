@@ -8,7 +8,7 @@
 <div class="panel"><h2>建立判例</h2><label>判例名稱<input id="caseTitle" placeholder="例如：第四節阻擋／帶球撞人"></label><div class="two"><label>比賽名稱<input id="game"></label><label>節次<input id="period" placeholder="Q4"></label></div><label>判例分類<select id="category"><option>阻擋／帶球撞人</option><option>帶球走步</option><option>違反運動精神犯規</option><option>技術犯規</option><option>掩護犯規</option><option>非法用手</option><option>24秒違例</option><option>裁判站位與輪轉</option><option>其他</option></select></label><label>原始宣判<input id="original"></label><label>FIBA規則依據<input id="rule" placeholder="例如：Art. 33"></label><label>分析說明<textarea id="notes"></textarea></label><label>外部影片連結（選填）<input id="sourceUrl" placeholder="https://..."></label><button class="primary wide" id="saveCase">儲存至群組資料庫</button><p class="muted">儲存判例後，如果選擇了本機影片，會再上傳至伺服器（上限由管理員設定，預設25MB）。</p></div></div></section>
 <section id="library" class="panel hide"><h2>📚 群組判例資料庫</h2><input id="search" class="wide" placeholder="搜尋判例名稱、分類、比賽、規則"><div id="caseList"></div></section>
 <section id="discussion" class="panel hide"><h2>💬 判例討論</h2><select id="caseSelect" class="wide"></select><div class="row"><button id="deleteCase" class="danger hide">刪除目前判例</button></div><div id="detail"></div><div id="discussionContent"></div><h3>投票（非官方裁定）</h3><div class="row" id="voteChoices"><button class="vote" data-choice="正確宣判">正確宣判</button><button class="vote" data-choice="錯誤宣判">錯誤宣判</button><button class="vote" data-choice="需要更多角度">需要更多角度</button></div><h3>發表分析</h3><textarea id="commentBody" placeholder="說明判斷及規則依據"></textarea><button id="sendComment" class="primary">發表留言</button></section>
-<section id="manage" class="panel hide"><h2>🗑 刪除管理</h2><p class="muted">你可以刪除自己建立的判例；只有群組建立者才能刪除整個群組。刪除後不能復原。</p><h3>群組刪除</h3><div id="manageGroup"></div><h3>判例刪除</h3><div id="manageCases"></div></section>
+<section id="manage" class="panel hide"><h2>🗑 刪除管理</h2><p class="muted">你可以刪除自己建立的判例；只有群組建立者才能刪除整個群組。刪除後不能復原。</p><h3>群組管理</h3><div id="manageGroup"></div><h3>群組成員</h3><div id="manageMembers" class="muted">選擇群組以載入成員</div><h3>判例刪除</h3><div id="manageCases"></div></section>
 <section id="account" class="panel hide"><h2>🔐 帳號安全</h2><p class="muted">定期更換密碼可以保護私人群組判例。更新成功後會登出所有裝置，請使用新密碼重新登入。</p>
 <div class="two"><label>目前密碼<input id="currentPassword" type="password" autocomplete="current-password"></label><label>新密碼（至少12字）<input id="newPassword" type="password" autocomplete="new-password"></label></div>
 <button id="changePassword" class="primary">更新密碼並登出所有裝置</button>
@@ -29,19 +29,29 @@ $('changePassword').onclick=()=>action(async()=>{const current=$('currentPasswor
  await api('/me/change-password',{method:'POST',body:JSON.stringify({current_password:current,new_password:next})});
  $('currentPassword').value='';$('newPassword').value='';token='';myUserId='';sessionStorage.removeItem('brrs_token');$('who').textContent='';showAuth(false);status('密碼已更新，請用新密碼登入')});
 async function loadGroups(){groups=await api('/groups');$('groupSelect').replaceChildren(...groups.map(g=>new Option(g.name,g.id)));currentGroup=groups.some(g=>g.id===currentGroup)?currentGroup:(groups[0]?.id||'');$('groupSelect').value=currentGroup;showInvite();await loadCases()}
-function showInvite(){const g=groups.find(g=>g.id===currentGroup);$('deleteGroup').classList.toggle('hide',!g||g.role!=='owner');renderManagement();$('inviteDisplay').textContent=g?'群組邀請碼：'+g.invite+'（只分享給信任的裁判）':'尚無群組，請建立或加入'}
+function showInvite(){const g=groups.find(g=>g.id===currentGroup);$('deleteGroup').classList.toggle('hide',!g||g.role!=='owner');renderManagement();loadMembers();$('inviteDisplay').textContent=g?(g.role==='owner'?'群組邀請碼：'+g.invite+'（只分享給信任的裁判）':'已加入私人裁判群組；邀請碼僅建立者可查看'):'尚無群組，請建立或加入'}
 $('groupSelect').onchange=()=>action(async()=>{currentGroup=$('groupSelect').value;showInvite();await loadCases()});$('refresh').onclick=()=>action(loadGroups);
 $('createGroup').onclick=()=>action(async()=>{await api('/groups',{method:'POST',body:JSON.stringify({name:$('groupName').value})});$('groupName').value='';await loadGroups();status('群組建立成功')});
 $('joinGroup').onclick=()=>action(async()=>{await api('/groups/join',{method:'POST',body:JSON.stringify({code:$('inviteInput').value})});$('inviteInput').value='';await loadGroups();status('已加入群組')});
 $('deleteGroup').onclick=()=>action(async()=>{const g=groups.find(x=>x.id===currentGroup);if(!g||g.role!=='owner')throw Error('只有群組建立者可以刪除群組');if(!confirm('確定刪除「'+g.name+'」群組？所有判例、影片、投票與留言都會一起刪除，無法復原！'))return;const typed=prompt('為避免誤刪，請輸入完整群組名稱：'+g.name);if(typed!==g.name){if(typed!==null)status('群組名稱不一致，已取消刪除');return}await api('/groups/'+encodeURIComponent(g.id),{method:'DELETE'});currentGroup='';await loadGroups();status('群組及相關判例已刪除')});
 async function loadCases(){if(!currentGroup){cases=[]}else cases=await api('/cases?group_id='+encodeURIComponent(currentGroup));renderCases()}
+async function loadMembers(){
+ const target=$('manageMembers'),gid=currentGroup,g=groups.find(x=>x.id===gid);if(!target)return;
+ target.replaceChildren();if(!g){target.textContent='尚未選擇群組';return}
+ try{
+  const members=await api('/groups/'+gid+'/members');if(gid!==currentGroup)return;
+  for(const m of members){let d=document.createElement('div');d.className='row card';const label=document.createElement('span');label.textContent=m.name+'（'+(m.role==='owner'?'群組建立者':'成員')+'）';d.append(label);
+   if(g.role==='owner'&&m.id!==myUserId){let b=document.createElement('button');b.className='danger';b.textContent='移除成員';b.onclick=()=>action(async()=>{if(!confirm('確定將「'+m.name+'」移出這個群組？'))return;await api('/groups/'+gid+'/members/'+m.id,{method:'DELETE'});await loadMembers();status('已移除成員')});d.append(b)}
+   target.append(d)}
+ }catch(e){target.textContent='讀取群組成員失敗：'+e.message}
+}
 function renderManagement(){
  const mg=$('manageGroup'),mc=$('manageCases');if(!mg||!mc)return;
  mg.replaceChildren();mc.replaceChildren();
  const g=groups.find(x=>x.id===currentGroup);
  if(!g){mg.textContent='請先選擇群組';mc.textContent='尚無判例';return}
  let info=document.createElement('p');info.textContent='目前群組：'+g.name+'｜身分：'+(g.role==='owner'?'群組建立者':'群組成員');mg.append(info);
- if(g.role==='owner'){let b=document.createElement('button');b.className='danger';b.textContent='🗑 永久刪除「'+g.name+'」群組';b.onclick=()=>$('deleteGroup').click();mg.append(b)}
+ if(g.role==='owner'){let rotate=document.createElement('button');rotate.textContent='🔄 更換群組邀請碼';rotate.onclick=()=>action(async()=>{if(!confirm('更換後舊邀請碼立即失效，確定繼續？'))return;await api('/groups/'+g.id+'/rotate-invite',{method:'POST'});await loadGroups();status('邀請碼已更新')});mg.append(rotate);let b=document.createElement('button');b.className='danger';b.textContent='🗑 永久刪除「'+g.name+'」群組';b.onclick=()=>$('deleteGroup').click();mg.append(b)}
  else{let p=document.createElement('p');p.className='muted';p.textContent='只有群組建立者可以刪除群組';mg.append(p)}
  if(!cases.length){mc.textContent='此群組尚無判例';return}
  cases.forEach(c=>{let item=document.createElement('div');item.className='card';let label=document.createElement('span');label.textContent=c.title+'｜'+(c.category||'未分類')+'｜上傳者：'+c.author_name;item.append(label);
