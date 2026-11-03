@@ -158,7 +158,13 @@ def change_password(p:ChangePassword,u=Depends(user)):
 
 @app.get('/api/groups')
 def groups(u=Depends(user)):
- with conn() as c:return [obj(x) for x in c.execute('SELECT groups.id,groups.name,CASE WHEN members.role='owner' THEN groups.invite ELSE NULL END AS invite,members.role FROM groups JOIN members ON groups.id=members.group_id WHERE members.user_id=? ORDER BY groups.created DESC',(u['id'],))]
+ with conn() as c:
+  sql="""SELECT groups.id,groups.name,
+          CASE WHEN members.role='owner' THEN groups.invite ELSE NULL END AS invite,
+          members.role
+          FROM groups JOIN members ON groups.id=members.group_id
+          WHERE members.user_id=? ORDER BY groups.created DESC"""
+  return [obj(x) for x in c.execute(sql,(u['id'],))]
 
 @app.post('/api/groups')
 def create_group(p:GroupIn,u=Depends(user)):
