@@ -1,4 +1,4 @@
-"""BRRS cloud persistence: Supabase Postgres + private Supabase Storage.
+"""BRRS cloud persistence: Supabase Postgres + Cloudflare R2 / Supabase Storage.
 All credentials stay server-side in Render environment variables.
 """
 import os
