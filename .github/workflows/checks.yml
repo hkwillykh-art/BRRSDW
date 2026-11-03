@@ -20,4 +20,4 @@ jobs:
       - name: Compile Python sources
         run: python -m compileall -q app.py cloud_backend.py
       - name: Smoke checks
-        run: pytest -q tests
+        run: python -m pytest -q tests
